@@ -15,6 +15,8 @@ import sys
 import json
 import re
 import os
+import atexit
+import fcntl
 from pathlib import Path
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -317,6 +319,234 @@ def _read_single_expert_attrs(expert_idx, layer_idx, expert_file_map, header_cac
     return expert_idx, results, io_stats
 
 
+# ---------------------------------------------------------------------------
+# pread()-based expert loading (bypasses safetensors, uses pre-built index)
+# ---------------------------------------------------------------------------
+
+# Global state for pread file descriptors (cleaned up via atexit)
+_pread_fds = {}  # filename -> fd
+
+
+def _cleanup_pread_fds():
+    """Close all pread file descriptors at exit."""
+    for fd in _pread_fds.values():
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _pread_fds.clear()
+
+atexit.register(_cleanup_pread_fds)
+
+
+def load_expert_index(model_path):
+    """Load expert_index.json and open all shard file descriptors.
+
+    Args:
+        model_path: Path to model directory (used to resolve shard filenames)
+
+    Returns:
+        (expert_index, fds) where:
+        - expert_index: parsed expert_index.json dict
+        - fds: dict mapping filename -> os file descriptor (O_RDONLY, F_NOCACHE)
+    """
+    index_path = Path("expert_index.json")
+    if not index_path.exists():
+        index_path = Path(model_path) / "expert_index.json"
+    if not index_path.exists():
+        raise FileNotFoundError(
+            f"expert_index.json not found in working directory or {model_path}")
+
+    with open(index_path) as f:
+        expert_index = json.load(f)
+
+    # Collect all unique shard filenames
+    shard_files = set()
+    for tensor_info in expert_index["tensors"].values():
+        shard_files.add(tensor_info["file"])
+
+    # Also collect from expert_reads (may reference different files)
+    for layer_reads in expert_index.get("expert_reads", {}).values():
+        for comp_info in layer_reads.values():
+            shard_files.add(comp_info["file"])
+
+    # Resolve full paths and open file descriptors
+    resolved_model_path = Path(expert_index.get("model_path", str(model_path)))
+    fds = {}
+    for filename in sorted(shard_files):
+        filepath = resolved_model_path / filename
+        if not filepath.exists():
+            # Try model_path argument as fallback
+            filepath = Path(model_path) / filename
+        fd = os.open(str(filepath), os.O_RDONLY)
+        # Bypass kernel buffer cache on macOS (we manage our own LRU cache)
+        try:
+            fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        except (OSError, AttributeError):
+            pass  # F_NOCACHE not available on this platform
+        fds[filename] = fd
+
+    # Store globally for atexit cleanup
+    _pread_fds.update(fds)
+
+    print(f"[pread] Loaded expert index: {len(expert_index.get('expert_reads', {}))} layers, "
+          f"{len(fds)} shard files opened with F_NOCACHE")
+
+    return expert_index, fds
+
+
+# Dtype mapping for pread path
+_PREAD_NP_DTYPE = {
+    'U32': (np.uint32, 4),
+    'F32': (np.float32, 4),
+    'BF16': (np.uint16, 2),  # read as uint16, convert to bfloat16
+    'F16': (np.float16, 2),
+    'I32': (np.int32, 4),
+}
+
+
+def pread_expert(expert_index, fds, layer, expert_idx):
+    """Read all 9 tensor components for a single expert using os.pread().
+
+    Args:
+        expert_index: parsed expert_index.json dict
+        fds: dict mapping shard filename -> os file descriptor
+        layer: layer index (int)
+        expert_idx: expert index (int)
+
+    Returns:
+        (expert_idx, results_dict, io_stats_dict) matching _read_single_expert_attrs format.
+        results_dict: {(proj_name, attr_name): mx.array} with per-expert shapes
+        io_stats_dict: {"bytes_read": int, "seek_count": int, "io_time_s": float, "array_time_s": float}
+    """
+    layer_reads = expert_index["expert_reads"][str(layer)]
+    results = {}
+    io_bytes = 0
+    io_seeks = 0
+    io_time = 0.0
+    array_time = 0.0
+
+    for comp_name, comp_info in layer_reads.items():
+        # comp_name is like "gate_proj.weight", "gate_proj.scales", etc.
+        parts = comp_name.split(".")
+        proj_name = parts[0]  # gate_proj, up_proj, down_proj
+        attr_name = parts[1]  # weight, scales, biases
+
+        fd = fds[comp_info["file"]]
+        abs_offset = comp_info["abs_offset"]
+        expert_stride = comp_info["expert_stride"]
+        expert_size = comp_info["expert_size"]
+        dtype_str = comp_info["dtype"]
+        shape = comp_info["shape_per_expert"]
+
+        offset = abs_offset + expert_idx * expert_stride
+
+        t_io = time.time()
+        raw = os.pread(fd, expert_size, offset)
+        io_time += time.time() - t_io
+        io_bytes += expert_size
+        io_seeks += 1
+
+        t_arr = time.time()
+        np_dtype, _ = _PREAD_NP_DTYPE[dtype_str]
+        np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+
+        if dtype_str == 'BF16':
+            np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+            results[(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
+        else:
+            results[(proj_name, attr_name)] = mx.array(np_arr)
+        array_time += time.time() - t_arr
+
+    io_stats = {
+        "bytes_read": io_bytes,
+        "seek_count": io_seeks,
+        "io_time_s": io_time,
+        "array_time_s": array_time,
+    }
+    return expert_idx, results, io_stats
+
+
+def pread_expert_batch(expert_index, fds, layer, expert_indices):
+    """Read all tensor components for multiple experts using sorted os.pread() calls.
+
+    Collects all read operations across all requested experts, sorts them by
+    (fd, offset) for sequential disk access, then executes all reads. This
+    exploits the fact that adjacent expert indices are physically contiguous
+    within each tensor shard.
+
+    Args:
+        expert_index: parsed expert_index.json dict
+        fds: dict mapping shard filename -> os file descriptor
+        layer: layer index (int)
+        expert_indices: list of expert indices to read
+
+    Returns:
+        (batch_results, batch_io_stats) where:
+        - batch_results: {expert_idx: {(proj_name, attr_name): mx.array}}
+        - batch_io_stats: {"bytes_read": int, "seek_count": int,
+                           "io_time_s": float, "array_time_s": float}
+    """
+    layer_reads = expert_index["expert_reads"][str(layer)]
+
+    # Phase 1: Collect all read operations
+    # Each entry: (fd_num, offset, size, expert_idx, proj_name, attr_name, dtype_str, shape)
+    read_ops = []
+    for expert_idx in expert_indices:
+        for comp_name, comp_info in layer_reads.items():
+            parts = comp_name.split(".")
+            proj_name = parts[0]
+            attr_name = parts[1]
+
+            filename = comp_info["file"]
+            fd = fds[filename]
+            abs_offset = comp_info["abs_offset"]
+            expert_stride = comp_info["expert_stride"]
+            expert_size = comp_info["expert_size"]
+            dtype_str = comp_info["dtype"]
+            shape = comp_info["shape_per_expert"]
+
+            offset = abs_offset + expert_idx * expert_stride
+            read_ops.append((fd, offset, expert_size, expert_idx,
+                             proj_name, attr_name, dtype_str, shape))
+
+    # Phase 2: Sort by (fd, offset) for sequential access
+    read_ops.sort(key=lambda x: (x[0], x[1]))
+
+    # Phase 3: Execute all reads
+    batch_results = {idx: {} for idx in expert_indices}
+    io_bytes = 0
+    io_seeks = 0
+    io_time = 0.0
+    array_time = 0.0
+
+    for fd, offset, size, expert_idx, proj_name, attr_name, dtype_str, shape in read_ops:
+        t_io = time.time()
+        raw = os.pread(fd, size, offset)
+        io_time += time.time() - t_io
+        io_bytes += size
+        io_seeks += 1
+
+        t_arr = time.time()
+        np_dtype, _ = _PREAD_NP_DTYPE[dtype_str]
+        np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+
+        if dtype_str == 'BF16':
+            np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+            batch_results[expert_idx][(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
+        else:
+            batch_results[expert_idx][(proj_name, attr_name)] = mx.array(np_arr)
+        array_time += time.time() - t_arr
+
+    batch_io_stats = {
+        "bytes_read": io_bytes,
+        "seek_count": io_seeks,
+        "io_time_s": io_time,
+        "array_time_s": array_time,
+    }
+    return batch_results, batch_io_stats
+
+
 class ExpertCache:
     """LRU cache for expert weight slices keyed by (layer, expert_id).
 
@@ -403,7 +633,8 @@ class ExpertCache:
         return self.hits / total if total > 0 else 0.0
 
 
-def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk_per_layer, header_cache):
+def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk_per_layer, header_cache,
+                        use_pread=False, pread_index=None, pread_fds=None):
     """Pre-load the hottest experts per layer into the ExpertCache at startup.
 
     Uses profiling data from expert_routing_profile.npz (if it exists) to identify
@@ -417,6 +648,9 @@ def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk
         num_layers: number of MoE layers
         topk_per_layer: how many experts to preload per layer
         header_cache: dict for caching safetensors headers (populated in-place)
+        use_pread: if True, use pread_expert_batch instead of _read_single_expert_attrs
+        pread_index: expert_index dict (required if use_pread=True)
+        pread_fds: fd dict (required if use_pread=True)
     """
     t_start = time.time()
 
@@ -440,22 +674,23 @@ def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk
               f"per layer (uniform fallback)", flush=True)
         layer_topk = {i: list(range(topk_per_layer)) for i in range(num_layers)}
 
-    # --- Build expert_file_map and pre-populate header_cache for all layers ---
-    layer_expert_maps = {}
-    all_expert_files = set()
-    for layer_idx in range(num_layers):
-        entries = weight_index.get(layer_idx, [])
-        _, expert_entries = split_layer_entries(entries)
-        expert_file_map = {}
-        for name, filepath in expert_entries:
-            expert_file_map[name] = filepath
-            all_expert_files.add(filepath)
-        layer_expert_maps[layer_idx] = expert_file_map
+    if not use_pread:
+        # --- Build expert_file_map and pre-populate header_cache for all layers ---
+        layer_expert_maps = {}
+        all_expert_files = set()
+        for layer_idx in range(num_layers):
+            entries = weight_index.get(layer_idx, [])
+            _, expert_entries = split_layer_entries(entries)
+            expert_file_map = {}
+            for name, filepath in expert_entries:
+                expert_file_map[name] = filepath
+                all_expert_files.add(filepath)
+            layer_expert_maps[layer_idx] = expert_file_map
 
-    # Parse all safetensors headers upfront (needed by _read_single_expert_attrs)
-    for filepath in all_expert_files:
-        if filepath not in header_cache:
-            header_cache[filepath] = parse_safetensors_header(filepath)
+        # Parse all safetensors headers upfront (needed by _read_single_expert_attrs)
+        for filepath in all_expert_files:
+            if filepath not in header_cache:
+                header_cache[filepath] = parse_safetensors_header(filepath)
 
     # --- Preload experts in batches of 10 layers using ThreadPoolExecutor ---
     total_loaded = 0
@@ -468,37 +703,54 @@ def preload_hot_experts(expert_cache, weight_index, model_path, num_layers, topk
         batch_loaded = 0
         batch_bytes = 0
 
-        # Collect all (layer, expert) pairs for this batch
-        work_items = []
-        for layer_idx in range(batch_start, batch_end):
-            expert_file_map = layer_expert_maps.get(layer_idx, {})
-            if not expert_file_map:
-                continue
-            experts_to_load = layer_topk.get(layer_idx, [])
-            for expert_idx in experts_to_load:
-                # Skip if already in cache (shouldn't happen at startup, but be safe)
-                if not expert_cache.has_expert(layer_idx, expert_idx):
-                    work_items.append((expert_idx, layer_idx, expert_file_map))
-
-        if not work_items:
-            continue
-
-        # Parallel read with ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_layer = {}
-            for expert_idx, layer_idx, expert_file_map in work_items:
-                fut = executor.submit(
-                    _read_single_expert_attrs,
-                    expert_idx, layer_idx, expert_file_map, header_cache
-                )
-                future_to_layer[fut] = layer_idx
-            for future in future_to_layer:
-                eidx, attrs, io_stats = future.result()
-                layer_idx = future_to_layer[future]
+        if use_pread:
+            # pread path: use pread_expert_batch per layer
+            for layer_idx in range(batch_start, batch_end):
+                experts_to_load = layer_topk.get(layer_idx, [])
+                uncached = [eidx for eidx in experts_to_load
+                            if not expert_cache.has_expert(layer_idx, eidx)]
+                if not uncached:
+                    continue
+                batch_results, io_stats = pread_expert_batch(
+                    pread_index, pread_fds, layer_idx, uncached)
                 batch_bytes += io_stats["bytes_read"]
-                for (proj_name, attr_name), arr in attrs.items():
-                    expert_cache.put_attr(layer_idx, eidx, proj_name, attr_name, arr)
-                batch_loaded += 1
+                for eidx, attrs in batch_results.items():
+                    for (proj_name, attr_name), arr in attrs.items():
+                        expert_cache.put_attr(layer_idx, eidx, proj_name, attr_name, arr)
+                    batch_loaded += 1
+        else:
+            # Original safetensors path
+            # Collect all (layer, expert) pairs for this batch
+            work_items = []
+            for layer_idx in range(batch_start, batch_end):
+                expert_file_map = layer_expert_maps.get(layer_idx, {})
+                if not expert_file_map:
+                    continue
+                experts_to_load = layer_topk.get(layer_idx, [])
+                for expert_idx in experts_to_load:
+                    # Skip if already in cache (shouldn't happen at startup, but be safe)
+                    if not expert_cache.has_expert(layer_idx, expert_idx):
+                        work_items.append((expert_idx, layer_idx, expert_file_map))
+
+            if not work_items:
+                continue
+
+            # Parallel read with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_layer = {}
+                for expert_idx, layer_idx, expert_file_map in work_items:
+                    fut = executor.submit(
+                        _read_single_expert_attrs,
+                        expert_idx, layer_idx, expert_file_map, header_cache
+                    )
+                    future_to_layer[fut] = layer_idx
+                for future in future_to_layer:
+                    eidx, attrs, io_stats = future.result()
+                    layer_idx = future_to_layer[future]
+                    batch_bytes += io_stats["bytes_read"]
+                    for (proj_name, attr_name), arr in attrs.items():
+                        expert_cache.put_attr(layer_idx, eidx, proj_name, attr_name, arr)
+                    batch_loaded += 1
 
         total_loaded += batch_loaded
         total_bytes += batch_bytes
@@ -1181,7 +1433,8 @@ def split_layer_entries(entries):
 
 
 def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path,
-                               preload_topk=0, cache_gb=20.0, profile=False):
+                               preload_topk=0, cache_gb=20.0, profile=False,
+                               use_pread=False, pread_index=None, pread_fds=None):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1290,7 +1543,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # === Pre-load hot experts if requested ===
     if preload_topk > 0:
         preload_hot_experts(expert_cache, weight_index, model_path, num_layers,
-                            preload_topk, header_cache)
+                            preload_topk, header_cache,
+                            use_pread=use_pread, pread_index=pread_index,
+                            pread_fds=pread_fds)
 
     # === Cache quantization parameters from model config (read once) ===
     # These are needed by compute_moe_direct for mx.gather_qmm calls.
@@ -1453,31 +1708,46 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 layer_io_bytes = 0
 
             if uncached_list:
-                # Pre-populate header_cache for all expert files (thread-safe after this)
-                for filepath in set(expert_file_map.values()):
-                    if filepath not in header_cache:
-                        header_cache[filepath] = parse_safetensors_header(filepath)
-
-                # Parallel read: each thread reads all 9 attrs for one expert
-                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                    futures = [
-                        executor.submit(
-                            _read_single_expert_attrs,
-                            expert_idx, i, expert_file_map, header_cache
-                        )
-                        for expert_idx in uncached_list
-                    ]
-                    for future in futures:
-                        eidx, attrs, io_stats = future.result()
-                        # Accumulate I/O stats from this expert read
-                        token_io_bytes += io_stats["bytes_read"]
-                        token_io_seeks += io_stats["seek_count"]
-                        token_io_time += io_stats["io_time_s"]
-                        token_array_time += io_stats["array_time_s"]
-                        if profile:
-                            layer_io_bytes += io_stats["bytes_read"]
+                if use_pread and pread_index is not None:
+                    # pread()-based expert loading (bypasses safetensors)
+                    batch_results, io_stats = pread_expert_batch(
+                        pread_index, pread_fds, i, uncached_list)
+                    token_io_bytes += io_stats["bytes_read"]
+                    token_io_seeks += io_stats["seek_count"]
+                    token_io_time += io_stats["io_time_s"]
+                    token_array_time += io_stats["array_time_s"]
+                    if profile:
+                        layer_io_bytes += io_stats["bytes_read"]
+                    for eidx, attrs in batch_results.items():
                         for (proj_name, attr_name), arr in attrs.items():
                             expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+                else:
+                    # Original safetensors path
+                    # Pre-populate header_cache for all expert files (thread-safe after this)
+                    for filepath in set(expert_file_map.values()):
+                        if filepath not in header_cache:
+                            header_cache[filepath] = parse_safetensors_header(filepath)
+
+                    # Parallel read: each thread reads all 9 attrs for one expert
+                    with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                        futures = [
+                            executor.submit(
+                                _read_single_expert_attrs,
+                                expert_idx, i, expert_file_map, header_cache
+                            )
+                            for expert_idx in uncached_list
+                        ]
+                        for future in futures:
+                            eidx, attrs, io_stats = future.result()
+                            # Accumulate I/O stats from this expert read
+                            token_io_bytes += io_stats["bytes_read"]
+                            token_io_seeks += io_stats["seek_count"]
+                            token_io_time += io_stats["io_time_s"]
+                            token_array_time += io_stats["array_time_s"]
+                            if profile:
+                                layer_io_bytes += io_stats["bytes_read"]
+                            for (proj_name, attr_name), arr in attrs.items():
+                                expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
             if profile:
                 t_io_done = time.perf_counter()
@@ -2011,6 +2281,9 @@ def generate_speculative(
     draft_k=8,
     preload_topk=0,
     cache_gb=20.0,
+    use_pread=False,
+    pread_index=None,
+    pread_fds=None,
 ):
     """Speculative decoding: draft K tokens with small model, verify with large model.
 
@@ -2112,7 +2385,9 @@ def generate_speculative(
     # === Pre-load hot experts if requested ===
     if preload_topk > 0:
         preload_hot_experts(expert_cache, weight_index, model_path, num_layers_v,
-                            preload_topk, header_cache)
+                            preload_topk, header_cache,
+                            use_pread=use_pread, pread_index=pread_index,
+                            pread_fds=pread_fds)
 
     # === Quantization params ===
     with open(model_path / "config.json") as f:
@@ -2208,22 +2483,29 @@ def generate_speculative(
                 uncached_list.append(idx)
 
         if uncached_list:
-            for filepath in set(expert_file_map.values()):
-                if filepath not in header_cache:
-                    header_cache[filepath] = parse_safetensors_header(filepath)
-
-            with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                futures = [
-                    executor.submit(
-                        _read_single_expert_attrs,
-                        expert_idx, i, expert_file_map, header_cache
-                    )
-                    for expert_idx in uncached_list
-                ]
-                for future in futures:
-                    eidx, attrs, io_stats = future.result()
+            if use_pread and pread_index is not None:
+                batch_results, io_stats = pread_expert_batch(
+                    pread_index, pread_fds, i, uncached_list)
+                for eidx, attrs in batch_results.items():
                     for (proj_name, attr_name), arr in attrs.items():
                         expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+            else:
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+
+                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                    futures = [
+                        executor.submit(
+                            _read_single_expert_attrs,
+                            expert_idx, i, expert_file_map, header_cache
+                        )
+                        for expert_idx in uncached_list
+                    ]
+                    for future in futures:
+                        eidx, attrs, io_stats = future.result()
+                        for (proj_name, attr_name), arr in attrs.items():
+                            expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
         expert_tensors = {}
         for proj_name in ["gate_proj", "up_proj", "down_proj"]:
@@ -2337,18 +2619,25 @@ def generate_speculative(
                 expert_cache.record_miss()
                 uncached_list.append(idx)
         if uncached_list:
-            for filepath in set(expert_file_map.values()):
-                if filepath not in header_cache:
-                    header_cache[filepath] = parse_safetensors_header(filepath)
-            with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                futures = [
-                    executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
-                    for eidx in uncached_list
-                ]
-                for future in futures:
-                    eidx, attrs, _ = future.result()
+            if use_pread and pread_index is not None:
+                batch_results, io_stats = pread_expert_batch(
+                    pread_index, pread_fds, i, uncached_list)
+                for eidx, attrs in batch_results.items():
                     for (pn, an), arr in attrs.items():
                         expert_cache.put_attr(i, eidx, pn, an, arr)
+            else:
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
+                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                    futures = [
+                        executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
+                        for eidx in uncached_list
+                    ]
+                    for future in futures:
+                        eidx, attrs, _ = future.result()
+                        for (pn, an), arr in attrs.items():
+                            expert_cache.put_attr(i, eidx, pn, an, arr)
 
         expert_tensors = {}
         for proj_name in ["gate_proj", "up_proj", "down_proj"]:
@@ -2488,26 +2777,35 @@ def generate_speculative(
                     expert_cache.record_miss()
                     uncached_list.append(idx)
 
-            # Load uncached experts from disk (threaded)
+            # Load uncached experts from disk
             if uncached_list:
-                for filepath in set(expert_file_map.values()):
-                    if filepath not in header_cache:
-                        header_cache[filepath] = parse_safetensors_header(filepath)
-
-                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                    futures = [
-                        executor.submit(
-                            _read_single_expert_attrs,
-                            expert_idx, i, expert_file_map, header_cache
-                        )
-                        for expert_idx in uncached_list
-                    ]
-                    for future in futures:
-                        eidx, attrs, io_stats = future.result()
-                        token_io_bytes += io_stats["bytes_read"]
-                        token_io_time += io_stats["io_time_s"]
+                if use_pread and pread_index is not None:
+                    batch_results, io_stats = pread_expert_batch(
+                        pread_index, pread_fds, i, uncached_list)
+                    token_io_bytes += io_stats["bytes_read"]
+                    token_io_time += io_stats["io_time_s"]
+                    for eidx, attrs in batch_results.items():
                         for (proj_name, attr_name), arr in attrs.items():
                             expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+                else:
+                    for filepath in set(expert_file_map.values()):
+                        if filepath not in header_cache:
+                            header_cache[filepath] = parse_safetensors_header(filepath)
+
+                    with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                        futures = [
+                            executor.submit(
+                                _read_single_expert_attrs,
+                                expert_idx, i, expert_file_map, header_cache
+                            )
+                            for expert_idx in uncached_list
+                        ]
+                        for future in futures:
+                            eidx, attrs, io_stats = future.result()
+                            token_io_bytes += io_stats["bytes_read"]
+                            token_io_time += io_stats["io_time_s"]
+                            for (proj_name, attr_name), arr in attrs.items():
+                                expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
             # Assemble expert tensors
             expert_tensors = {}
@@ -2710,21 +3008,28 @@ def generate_speculative(
                             uncached_list.append(idx)
 
                     if uncached_list:
-                        for filepath in set(expert_file_map.values()):
-                            if filepath not in header_cache:
-                                header_cache[filepath] = parse_safetensors_header(filepath)
-                        with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                            futures = [
-                                executor.submit(
-                                    _read_single_expert_attrs,
-                                    expert_idx, i, expert_file_map, header_cache
-                                )
-                                for expert_idx in uncached_list
-                            ]
-                            for future in futures:
-                                eidx, attrs, io_stats = future.result()
+                        if use_pread and pread_index is not None:
+                            batch_results, io_stats = pread_expert_batch(
+                                pread_index, pread_fds, i, uncached_list)
+                            for eidx, attrs in batch_results.items():
                                 for (proj_name, attr_name), arr in attrs.items():
                                     expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+                        else:
+                            for filepath in set(expert_file_map.values()):
+                                if filepath not in header_cache:
+                                    header_cache[filepath] = parse_safetensors_header(filepath)
+                            with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                                futures = [
+                                    executor.submit(
+                                        _read_single_expert_attrs,
+                                        expert_idx, i, expert_file_map, header_cache
+                                    )
+                                    for expert_idx in uncached_list
+                                ]
+                                for future in futures:
+                                    eidx, attrs, io_stats = future.result()
+                                    for (proj_name, attr_name), arr in attrs.items():
+                                        expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
                     expert_tensors = {}
                     for proj_name in ["gate_proj", "up_proj", "down_proj"]:
@@ -2853,18 +3158,25 @@ def generate_speculative(
                     expert_cache.record_miss()
                     uncached_list.append(idx)
             if uncached_list:
-                for filepath in set(expert_file_map.values()):
-                    if filepath not in header_cache:
-                        header_cache[filepath] = parse_safetensors_header(filepath)
-                with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                    futures = [
-                        executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
-                        for eidx in uncached_list
-                    ]
-                    for future in futures:
-                        eidx, attrs, _ = future.result()
+                if use_pread and pread_index is not None:
+                    batch_results, io_stats = pread_expert_batch(
+                        pread_index, pread_fds, i, uncached_list)
+                    for eidx, attrs in batch_results.items():
                         for (pn, an), arr in attrs.items():
                             expert_cache.put_attr(i, eidx, pn, an, arr)
+                else:
+                    for filepath in set(expert_file_map.values()):
+                        if filepath not in header_cache:
+                            header_cache[filepath] = parse_safetensors_header(filepath)
+                    with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                        futures = [
+                            executor.submit(_read_single_expert_attrs, eidx, i, expert_file_map, header_cache)
+                            for eidx in uncached_list
+                        ]
+                        for future in futures:
+                            eidx, attrs, _ = future.result()
+                            for (pn, an), arr in attrs.items():
+                                expert_cache.put_attr(i, eidx, pn, an, arr)
 
             expert_tensors = {}
             for proj_name in ["gate_proj", "up_proj", "down_proj"]:
@@ -3029,6 +3341,10 @@ def main():
     parser.add_argument("--profile", action="store_true", default=False,
                         help="Enable detailed per-layer profiling instrumentation in offload_selective mode. "
                              "Prints routing/cache/IO/compute/sync breakdown per layer after generation.")
+    parser.add_argument("--use-pread", action="store_true", default=False,
+                        help="Use pread()-based expert loading instead of safetensors mmap. "
+                             "Requires expert_index.json in working directory. "
+                             "Bypasses kernel buffer cache (F_NOCACHE) for direct SSD reads.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3135,6 +3451,13 @@ def main():
     # Build weight index for streaming/offload modes
     weight_index = build_weight_index(model_path) if args.mode in ("stream", "offload", "offload_lazy", "offload_selective", "speculative") else None
 
+    # Load pread expert index if requested
+    pread_index = None
+    pread_fds = None
+    if args.use_pread and args.mode in ("offload_selective", "speculative"):
+        print(f"[{fmt_time(time.time() - t_start)}] Loading expert_index.json for pread() path...")
+        pread_index, pread_fds = load_expert_index(model_path)
+
     # Generate
     print(f"[{fmt_time(time.time() - t_start)}] Generating {args.tokens} tokens ({args.mode})...")
     print(f"[{fmt_time(time.time() - t_start)}] Prompt: {args.prompt[:80]}{'...' if len(args.prompt) > 80 else ''}")
@@ -3146,6 +3469,7 @@ def main():
             draft_model, model, tokenizer, args.prompt, args.tokens,
             weight_index, model_path, draft_k=args.draft_k,
             preload_topk=args.preload_topk, cache_gb=args.cache_gb,
+            use_pread=args.use_pread, pread_index=pread_index, pread_fds=pread_fds,
         )
     elif args.mode == "offload_selective":
         # Selective offload: run attention+router first, then load only selected expert slices.
@@ -3154,7 +3478,10 @@ def main():
                                             weight_index, model_path,
                                             preload_topk=args.preload_topk,
                                             cache_gb=args.cache_gb,
-                                            profile=args.profile)
+                                            profile=args.profile,
+                                            use_pread=args.use_pread,
+                                            pread_index=pread_index,
+                                            pread_fds=pread_fds)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.

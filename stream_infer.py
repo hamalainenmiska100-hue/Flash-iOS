@@ -38,7 +38,7 @@ def parse_safetensors_header(filepath):
     return header, data_start
 
 
-def read_tensors_direct(filepath, tensor_names, header_cache):
+def read_tensors_direct(filepath, tensor_names, header_cache, file_handle_cache=None):
     """Read specific tensors from a safetensors file using direct I/O (not mmap).
     Returns dict of tensor_name -> mx.array (real Metal allocations, not mmap-backed).
 
@@ -48,6 +48,9 @@ def read_tensors_direct(filepath, tensor_names, header_cache):
     - F16 -> numpy float16 -> mx float16
     - I32 -> numpy int32 -> mx int32
     - BF16 -> read as uint16, shift to float32, cast to bfloat16
+
+    If file_handle_cache is provided (dict), file handles are kept open across calls
+    to avoid ~3456 open/close cycles per token (72 tensors × 48 layers).
     """
     if filepath not in header_cache:
         header_cache[filepath] = parse_safetensors_header(filepath)
@@ -65,8 +68,18 @@ def read_tensors_direct(filepath, tensor_names, header_cache):
     # Sort tensors by file offset for sequential I/O
     sorted_names = sorted(tensor_names, key=lambda n: header[n]['data_offsets'][0])
 
+    # Use cached file handle if available, otherwise open (and optionally cache)
+    owned_f = None
+    if file_handle_cache is not None:
+        if filepath not in file_handle_cache:
+            file_handle_cache[filepath] = open(filepath, 'rb')
+        f = file_handle_cache[filepath]
+    else:
+        owned_f = open(filepath, 'rb')
+        f = owned_f
+
     result = {}
-    with open(filepath, 'rb') as f:
+    try:
         for name in sorted_names:
             meta = header[name]
             off = meta['data_offsets']
@@ -89,11 +102,14 @@ def read_tensors_direct(filepath, tensor_names, header_cache):
                 result[name] = mx.array(np_f32).astype(mx.bfloat16)
             else:
                 raise ValueError(f"Unsupported safetensors dtype: {dtype_str}")
+    finally:
+        if owned_f is not None:
+            owned_f.close()
 
     return result
 
 
-def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cache):
+def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cache, file_handle_cache=None):
     """Read specific expert slices from a stacked [num_experts, ...] tensor using direct I/O.
 
     Args:
@@ -101,6 +117,9 @@ def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cach
         tensor_name: full tensor name in the safetensors file
         expert_indices: list/array of expert indices to read (e.g., [3, 17, 42, ...])
         header_cache: dict for caching parsed headers
+        file_handle_cache: optional dict mapping filepath -> open file handle.
+            If provided, file handles are kept open across calls to avoid
+            repeated open/close overhead (~3456 cycles/token).
 
     Returns: mx.array of shape [len(expert_indices), ...rest_dims]
     """
@@ -131,15 +150,28 @@ def read_expert_slices_direct(filepath, tensor_name, expert_indices, header_cach
         expert_elems *= d
     expert_bytes = expert_elems * elem_size
 
+    # Use cached file handle if available, otherwise open (and optionally cache)
+    owned_f = None
+    if file_handle_cache is not None:
+        if filepath not in file_handle_cache:
+            file_handle_cache[filepath] = open(filepath, 'rb')
+        f = file_handle_cache[filepath]
+    else:
+        owned_f = open(filepath, 'rb')
+        f = owned_f
+
     # Read each selected expert's data
     expert_arrays = []
-    with open(filepath, 'rb') as f:
+    try:
         for idx in expert_indices:
             offset = tensor_start + int(idx) * expert_bytes
             f.seek(offset)
             raw = f.read(expert_bytes)
             np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(expert_shape)
             expert_arrays.append(np_arr)
+    finally:
+        if owned_f is not None:
+            owned_f.close()
 
     # Stack into [num_selected, ...] array
     stacked = np.stack(expert_arrays, axis=0)
@@ -838,7 +870,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
     # Read from each file sequentially (sorted by offset within file)
     for filepath, names in sorted(file_to_names.items()):
-        tensors = read_tensors_direct(filepath, names, header_cache)
+        tensors = read_tensors_direct(filepath, names, header_cache, file_handle_cache=None)
         for name in names:
             if name in tensors:
                 san_name = file_to_san[(filepath, name)]
@@ -852,10 +884,14 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     preload_time = time.time() - t_preload
     print(f"  Pre-loaded non-expert weights for {num_layers} layers in {preload_time:.1f}s ({get_mem_gb():.1f}GB)")
 
+    # === File handle cache: keep safetensors files open for duration of inference ===
+    # Avoids ~3456 open/close cycles per token (72 tensor reads × 48 layers).
+    file_handle_cache = {}
+
     # === LRU cache for expert weight slices ===
-    # 768 entries = 48 layers × 8 experts × 2 tokens worth. ~3.8GB max.
-    # Need ≥384 per token to avoid complete eviction each token cycle.
-    expert_cache = ExpertCache(max_entries=768)
+    # 1536 entries = 48 layers × 8 experts × 4 tokens worth. ~7.6GB max.
+    # Larger cache improves hit rate as expert reuse grows with longer sequences.
+    expert_cache = ExpertCache(max_entries=1536)
 
     for token_idx in range(max_tokens):
         t_token_start = time.time()
@@ -943,7 +979,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                             continue
                         filepath = expert_file_map[full_key]
                         # Read only uncached experts' byte ranges (no mmap)
-                        fresh = read_expert_slices_direct(filepath, full_key, uncached_list, header_cache)
+                        fresh = read_expert_slices_direct(filepath, full_key, uncached_list, header_cache, file_handle_cache)
                         # fresh is [len(uncached_list), ...] — split and cache individually
                         for j, uidx in enumerate(uncached_list):
                             expert_cache.put_attr(i, uidx, proj_name, attr_name, fresh[j])
@@ -1049,6 +1085,13 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
         # Next iteration input
         input_ids = next_token.reshape(1, 1)
+
+    # Close cached file handles
+    for fh in file_handle_cache.values():
+        try:
+            fh.close()
+        except Exception:
+            pass
 
     total_time = time.time() - t_start
     total_tokens = len(generated_tokens)

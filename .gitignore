@@ -1,2 +1,10 @@
 documentation/
 .DS_Store
+.venv/
+__pycache__/
+*.pyc
+results.tsv
+progress.png
+logs/
+*.log
+.python-version

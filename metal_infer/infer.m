@@ -5144,6 +5144,8 @@ int main(int argc, char **argv) {
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
+            // F_NOCACHE: bypass page cache for direct SSD access (avoids cache thrashing)
+            if (layer_fds[i] >= 0 && g_use_2bit) fcntl(layer_fds[i], F_NOCACHE, 1);
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {

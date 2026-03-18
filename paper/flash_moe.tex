@@ -60,10 +60,10 @@
 \begin{abstract}
 We demonstrate that a 397 billion parameter Mixture-of-Experts language model (Qwen3.5-397B-A17B) can run on a laptop with only 48\,GB of unified memory at 5.74 tokens per second with production-quality output.
 Our approach combines NVMe SSD streaming of expert weights, aggressive requantization (2-bit experts with 0.001--0.003 RMSE per layer), and a custom Metal GPU compute pipeline written in Objective-C.
-The entire 120\,GB model streams from disk through parallel \texttt{pread()} calls, with only 5.5\,GB of weights resident in memory at any time.
+The entire 209\,GB model (120\,GB at 2-bit expert requantization) streams from disk through parallel \texttt{pread()} calls, with only 5.5\,GB of weights resident in memory at any time.
 Key innovations include a fused three-command-buffer GPU pipeline that eliminates CPU--GPU synchronization overhead, BLAS-accelerated linear attention for GatedDeltaNet layers, and---counterintuitively---\emph{removing} all application-level caching to let the macOS page cache manage expert data exclusively, which yielded a 38\% speedup by eliminating memory compressor thrashing.
 We achieve 5.74\,tok/s sustained and 7+\,tok/s peak on an Apple M3 Max.
-To our knowledge, this is the first demonstration of a model exceeding 8$\times$ DRAM capacity running at interactive speeds on consumer hardware.
+To our knowledge, this is the first demonstration of a model exceeding 4$\times$ DRAM capacity running at interactive speeds on consumer hardware.
 \end{abstract}
 
 % ============================================================================
@@ -238,7 +238,7 @@ In practice the improvement is $\sim$5\% end-to-end because most reads are SSD-b
 \section{Experimental Results}
 \label{sec:results}
 
-We report results from 90 experiments conducted over the development of Flash-MoE, spanning seven months of iterative optimization.
+We report results from 90 experiments conducted over the development of Flash-MoE, spanning approximately 24 hours of continuous human-AI collaborative optimization.
 All measurements use the same prompt (``Explain the concept of probability to a five year old'') and report steady-state generation speed after warmup (first 5 tokens excluded).
 
 \subsection{Performance Progression}
@@ -283,10 +283,11 @@ Third, the final ``Trust OS'' configuration demonstrates that removing \emph{all
 
 \subsection{Per-Layer Breakdown}
 
-The average per-layer time budget at the final 2-bit + OS page cache configuration (2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s) breaks down as follows: \textbf{Expert I/O} via parallel \texttt{pread()}: 1.37\,ms (47\%); \textbf{CMD1 wait} (GPU projections + deferred CMD3): 0.87\,ms (30\%); \textbf{CMD2 wait} (GPU routing + shared expert): 0.45\,ms (15\%); \textbf{CPU attention} (BLAS-accelerated GatedDeltaNet): 0.15\,ms (5\%); other overhead: 0.06\,ms (2\%).
+The average per-layer time budget at the final ``Trust OS'' configuration (2-bit experts, no \texttt{F\_NOCACHE}, no application-level cache; 2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s) breaks down as follows: \textbf{Expert I/O} via parallel \texttt{pread()}: 1.37\,ms (47\%); \textbf{CMD1 wait} (GPU projections + deferred CMD3): 0.87\,ms (30\%); \textbf{CMD2 wait} (GPU routing + shared expert): 0.45\,ms (15\%); \textbf{CPU attention} (BLAS-accelerated GatedDeltaNet): 0.15\,ms (5\%); other overhead: 0.06\,ms (2\%).
 Expert I/O dominates, consuming nearly half of the per-layer budget.
+Note that the serial sum of these components is 2.9\,ms, but the deferred CMD3 pipeline (Section~\ref{sec:pipeline}) overlaps expert GPU compute with the next layer's I/O and CMD1, so the actual wall-clock per-layer time is slightly less than the sum of individually measured stages.
 
-The I/O cost of 1.49\,ms per layer corresponds to reading $\sim$15.7\,MB of expert data (4 experts $\times$ 3.93\,MB) at an effective rate of 10.5\,GB/s---below the SSD's 17.5\,GB/s peak but consistent with the overhead of 4 scattered \texttt{pread()} calls rather than a single sequential read.
+The I/O cost of 1.37\,ms per layer corresponds to reading $\sim$15.7\,MB of expert data (4 experts $\times$ 3.93\,MB) at an effective rate of 11.5\,GB/s---below the SSD's 17.5\,GB/s peak but consistent with the overhead of 4 scattered \texttt{pread()} calls rather than a single sequential read.
 
 \subsection{Expert Routing Statistics}
 
@@ -410,8 +411,9 @@ Metal LRU cache (9.8\,GB) & GPU-visible shared memory caused compressor thrashin
 \end{tabular}
 \end{table}
 
-The most surprising failure was \texttt{mmap}: intuition suggests that memory-mapping the expert files would let the OS handle paging efficiently, but the page fault overhead for large uncached reads is catastrophic.
+The most surprising failure was \texttt{mmap} for expert I/O: intuition suggests that memory-mapping the expert files would let the OS handle paging efficiently, but the page fault overhead for large uncached reads is catastrophic.
 A single \texttt{pread()} of 3.9\,MB issues one system call and one DMA transfer; \texttt{mmap} access to the same data triggers $\sim$244 individual page faults (3.9\,MB / 16\,KB page size), each with kernel entry/exit overhead.
+Note that this penalty applies specifically to expert weight reads, where data is frequently uncached due to the 120\,GB working set; the non-expert base model weights (5.5\,GB) are \texttt{mmap}'d read-only with excellent performance, since they fit comfortably in DRAM and remain resident after initial page-in.
 
 % ============================================================================
 % 5. Analysis
@@ -420,7 +422,7 @@ A single \texttt{pread()} of 3.9\,MB issues one system call and one DMA transfer
 
 \subsection{Bottleneck Analysis}
 
-At steady state with 2-bit experts and \texttt{F\_NOCACHE}, the per-token pipeline is:
+At steady state with 2-bit experts and \texttt{F\_NOCACHE} (an intermediate configuration prior to the final ``Trust OS'' configuration described in Section~\ref{sec:trust_os}), the per-token pipeline is:
 
 \begin{align}
 t_\text{token} &= 60 \times t_\text{layer} \nonumber \\
@@ -428,6 +430,8 @@ t_\text{layer} &= t_\text{IO} + t_\text{GPU} + t_\text{CPU} \nonumber \\
                &= 1.49 + 1.32 + 0.33 = 3.14\text{\,ms} \nonumber \\
 t_\text{token} &= 60 \times 3.14 = 188\text{\,ms} \approx 5.3\text{\,tok/s} \nonumber
 \end{align}
+
+\noindent The final Trust OS configuration achieves 2.9\,ms/layer (5.74\,tok/s) by removing \texttt{F\_NOCACHE} and eliminating memory compressor overhead (Section~\ref{sec:trust_os}); we present the \texttt{F\_NOCACHE} breakdown here because the per-component instrumentation was collected at this configuration.
 
 The I/O budget per token:
 \begin{align}
@@ -502,6 +506,7 @@ Apple Silicon uses a hardware-accelerated memory compressor that compresses inac
 \texttt{vm\_stat} showed that the Metal LRU cache's 9.8\,GB of GPU-visible shared memory forced the compressor to work continuously: 60,000--130,000 decompressions per second, each consuming CPU cycles and memory bandwidth.
 Removing the Metal cache freed DRAM for the OS page cache, which uses ordinary (non-GPU-visible) pages that the compressor handles more efficiently.
 Decompressions dropped to near zero, and all that memory bandwidth became available for useful I/O.
+At approximately 16\,KB per decompressed page, the 60{,}000--130{,}000 decompressions per second represent 1--2\,GB/s of memory bandwidth consumed by the compressor---bandwidth that competes directly with GPU memory access and expert data DMA transfers on the shared unified memory bus.
 
 The analogy to database systems is apt: PostgreSQL's documentation explicitly warns against building application-level buffer pools that compete with the OS buffer cache.
 The same principle applies here---macOS already implements a sophisticated, hardware-aware page replacement policy tuned for Apple Fabric's unified memory architecture.
@@ -682,6 +687,20 @@ This underscores the importance of always verifying output quality, not just spe
 % ============================================================================
 \section{Discussion and Future Work}
 
+\subsection{Methodology: Human-AI Collaborative Optimization}
+
+This work was produced through approximately 24 hours of continuous collaboration between a human systems engineer (Daniel Woods) and an AI model (Claude Opus 4.6, Anthropic's AI, operating via the Claude Code CLI).
+The collaboration followed the \emph{autoresearch} protocol~\cite{karpathy2025autoresearch} adapted for systems optimization: the AI autonomously generated optimization hypotheses, implemented code changes, ran benchmarks, and decided whether to keep or discard each change---all under a strict 5-minute wall-clock limit per experiment with mandatory benchmark-before-and-after discipline and immediate revert on regression.
+
+The human's role was to direct research priorities, provide systems engineering expertise drawn from database performance tuning and hardware cache hierarchy knowledge, and supply the key conceptual insights that broke through optimization plateaus.
+Three such insights proved decisive: (1) ``treat expert weights like a database''---leading to the \texttt{pread()}-based I/O architecture inspired by database page management; (2) ``trust the OS cache''---the counterintuitive removal of application-level caching (Section~\ref{sec:trust_os}), analogous to PostgreSQL's advisory against application buffer pools; and (3) ``what about the hardware cache hierarchy''---prompting the \texttt{vm\_stat} investigation that revealed memory compressor thrashing as the root cause of cache-related slowdowns.
+
+The AI contributed the bulk of implementation work: the complete Objective-C/Metal inference engine ($\sim$5{,}000 lines), all Metal compute shaders ($\sim$1{,}100 lines), the 2-bit requantization pipeline, and the systematic exploration of 90+ optimization experiments.
+Every experiment was git-committed before execution and results were logged to a TSV file regardless of outcome.
+
+We highlight this methodology as a contribution in its own right: human-AI collaboration produced a publication-quality systems optimization result---from zero to a working 397B inference engine at interactive speeds---in a single day of wall-clock time.
+The autoresearch protocol's discipline (benchmark everything, revert regressions, log all results) was essential for maintaining forward progress across dozens of experiments, many of which failed.
+
 \paragraph{1-bit and ternary experts.}
 Our 2-bit requantization reduced expert size by 44\%.
 Ternary ($\{-1, 0, +1\}$) or binary quantization could push further, potentially halving I/O again.
@@ -795,8 +814,8 @@ S.~Rajbhandari, O.~Ruwase, J.~Rasley, S.~Smith, and Y.~He.
 
 \bibitem{karpathy2025autoresearch}
 A.~Karpathy.
-\newblock {The Unreasonable Effectiveness of Autoresearch}.
-\newblock Blog post, 2025.
+\newblock {autoresearch: AI agents running research on single-GPU nanochat training automatically}.
+\newblock \url{https://github.com/karpathy/autoresearch}, 2025.
 
 \end{thebibliography}
 

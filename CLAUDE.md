@@ -31,10 +31,13 @@ Results below are for Qwen3.5-397B-A17B on MacBook Pro M3 Max (48GB):
 |--------------|-------|---------|-------|
 | 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. |
 | 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
+| **Tiered (hot=4bit, cold=2bit)** | **4.36+** | **Excellent** | **33% smaller on disk. Auto-detected.** |
 | 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
 | 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
 
 *2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
+
+**Tiered mode** keeps frequently-activated experts (top ~25%) at 4-bit quality while requantizing cold experts to 2-bit — reducing disk footprint by ~34% without quality loss. Hot experts are profiled from real workloads. See [docs/tiered-expert-quantization.md](docs/tiered-expert-quantization.md) for the full experiment writeup.
 
 ## Hardware
 
@@ -51,6 +54,8 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 ### Key Techniques
 
 1. **SSD Expert Streaming** — Expert weights (209GB at 4-bit) are read from NVMe SSD on demand via parallel `pread()` with GCD dispatch groups. Only the K=4 active experts per layer are loaded (~6.75MB each). The OS page cache manages caching — no custom cache needed ("Trust the OS" principle). Inspired by Apple's "LLM in a Flash" paper.
+
+1. **Tiered Expert Quantization** — Expert usage follows a Zipfian distribution: ~25% of experts handle ~80% of activations. Hot experts stay at 4-bit; cold experts are requantized to 2-bit (44% smaller each). This shrinks total expert disk by ~34%, improving OS page cache hit rates without quality degradation. Per-expert Metal kernel dispatch selects the right dequant shader at runtime.
 
 2. **FMA-Optimized Dequant Kernel** — The inner loop of the 4-bit dequantized matrix-vector multiply rearranges the math from `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`. Pre-computing `scale*x` and `bias*x` lets the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than the naive formulation.
 
@@ -117,6 +122,25 @@ python metal_infer/extract_weights.py --model ~/.cache/huggingface/hub/models--m
 cd metal_infer && ./infer --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit --prompt "Hello" --tokens 20
 ```
 
+### Tiered Expert Quantization (Optional)
+
+Reduces expert disk footprint by ~34% by keeping hot experts at 4-bit and requantizing cold experts to 2-bit. Recommended for memory-constrained setups:
+
+```bash
+# 1. Profile expert usage (run a few diverse prompts)
+./infer --model <MODEL> --prompt "Explain quantum computing" --tokens 200 --freq 2>&1 | tee /tmp/freq1.txt
+./infer --model <MODEL> --prompt "Write a Python function" --tokens 200 --freq 2>&1 | tee /tmp/freq2.txt
+
+# 2. Generate hot expert manifest (80% coverage threshold)
+python profile_experts.py --freq-output /tmp/freq1.txt /tmp/freq2.txt --coverage 0.8
+
+# 3. Repack experts (creates packed_experts_tiered/)
+python repack_experts_tiered.py --model <MODEL>
+
+# 4. Run with --tiered (or auto-detected if packed_experts_tiered/ exists)
+cd metal_infer && ./infer --model <MODEL> --tiered --prompt "Hello" --tokens 20
+```
+
 ## Quick Start
 
 ```bash
@@ -134,7 +158,11 @@ export FLASH_MOE_MODEL=~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-3
 # 2-bit inference (faster but breaks tool calling)
 ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
-# Interactive chat with tool calling
+# Tiered mode (hot=4-bit, cold=2-bit, auto-detected if packed_experts_tiered/ exists)
+./infer --prompt "Explain quantum computing" --tokens 100 --tiered
+
+# Interactive chat with tool calling (start server first, then chat client)
+./infer --serve &
 ./chat
 
 # Per-layer timing breakdown
@@ -146,6 +174,8 @@ export FLASH_MOE_MODEL=~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-3
 ```
 model_manager.py       # Model discovery, download, and compatibility checking
 repack_experts.py      # 4-bit expert packing from safetensors
+profile_experts.py     # Expert frequency profiling → hot_experts.json
+repack_experts_tiered.py  # Tiered repacking (hot=4-bit, cold=2-bit)
 progress.py            # Results visualization (Q2/Q4 tracks)
 results.tsv            # Experiment log (58 experiments)
 
@@ -181,6 +211,7 @@ metal_infer/
 | GPU fused attention (RoPE) | +2% for full-attn layers | **Small** |
 | C BPE tokenizer | 180ms vs 3500ms startup | **20x startup** |
 | Deferred CMD3 execution | GPU/CPU overlap | **Pipeline** |
+| Tiered expert quant (hot=4b, cold=2b) | -34% disk, same quality | **Cache hit rate** |
 
 ### Discarded (58 experiments, highlights)
 | Approach | Result | Why |

@@ -1,0 +1,66 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "FlashMoE-iOS/**"
+      - ".github/workflows/build-unsigned-ipa.yml"
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-15
+
+    env:
+      PROJECT_PATH: FlashMoE-iOS/FlashMoE.xcodeproj
+      SCHEME: FlashMoE
+      CONFIGURATION: Release
+      ARCHIVE_PATH: ${{ github.workspace }}/build/FlashMoE.xcarchive
+      EXPORT_DIR: ${{ github.workspace }}/build/export
+      APP_NAME: FlashMoE.app
+      IPA_NAME: FlashMoE-unsigned.ipa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build archive without code signing
+        run: |
+          set -euxo pipefail
+
+          mkdir -p build/export
+
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination "generic/platform=iOS" \
+            -archivePath "$ARCHIVE_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Create unsigned IPA manually
+        run: |
+          set -euxo pipefail
+
+          APP_PATH="$ARCHIVE_PATH/Products/Applications/$APP_NAME"
+
+          test -d "$APP_PATH"
+
+          mkdir -p "$EXPORT_DIR/Payload"
+          cp -R "$APP_PATH" "$EXPORT_DIR/Payload/$APP_NAME"
+
+          cd "$EXPORT_DIR"
+          /usr/bin/zip -r "$IPA_NAME" Payload
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashmoe-unsigned-ipa
+          path: ${{ env.EXPORT_DIR }}/${{ env.IPA_NAME }}
+          if-no-files-found: error

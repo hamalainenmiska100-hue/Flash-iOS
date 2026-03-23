@@ -24,17 +24,58 @@ struct GenerationToken {
 struct ModelInfo {
     let name: String
     let numLayers: Int
+    let numLinearLayers: Int
+    let numFullAttnLayers: Int
     let numExperts: Int
     let activeExpertsK: Int
     let hiddenDim: Int
     let vocabSize: Int
+    let numAttnHeads: Int
+    let numKVHeads: Int
+    let headDim: Int
+    let moeIntermediate: Int
+    let expertQuantBits: Int
+    let denseQuantBits: Int
+    let denseAvgBits: Float
+    let isSmokeTest: Bool
     let weightFileBytes: UInt64
     let expertFileBytes: UInt64
     let metalBufferBytes: UInt64
+    let expertSizeEach: UInt64
 
     var weightFileMB: Double { Double(weightFileBytes) / 1_048_576 }
     var expertFileMB: Double { Double(expertFileBytes) / 1_048_576 }
     var totalSizeMB: Double { weightFileMB + expertFileMB }
+    var totalSizeGB: Double { totalSizeMB / 1024 }
+    var expertSizeEachMB: Double { Double(expertSizeEach) / 1_048_576 }
+
+    /// Estimated total parameters (rough)
+    var estimatedParams: String {
+        // Qwen3.5-397B-A17B: 397B total, 17B active
+        // Qwen3.5-35B-A3B: 35B total, 3B active
+        // Use expert count + dense weights as rough indicator
+        if numExperts >= 512 && hiddenDim == 4096 {
+            return "397B total / 17B active"
+        } else if numExperts >= 128 && hiddenDim == 2048 {
+            return "35B total / 3B active"
+        } else if numExperts < 512 && hiddenDim == 4096 {
+            return "397B (smoke: \(numExperts)/512 experts)"
+        }
+        return "unknown"
+    }
+
+    var quantLabel: String {
+        switch expertQuantBits {
+        case 2: return "2-bit"
+        case 3: return "Q3 (IQ3_XXS/IQ4_XS)"
+        case 4: return "4-bit"
+        default: return "\(expertQuantBits)-bit"
+        }
+    }
+
+    var denseQuantLabel: String {
+        String(format: "MLX %d-bit (avg %.1f bits/param)", denseQuantBits, denseAvgBits)
+    }
 }
 
 /// Engine state for UI binding
@@ -57,6 +98,9 @@ final class FlashMoEEngine: @unchecked Sendable {
     private(set) var tokensGenerated: Int = 0
     private(set) var timeToFirstToken: Double = 0
 
+    /// Smoke test mode: model has fewer than 512 experts (degraded, skip chat template)
+    var isSmoke: Bool { (modelInfo?.numExperts ?? 512) < 512 }
+
     // Private engine state
     private var context: OpaquePointer?  // FlashMoEContext*
     private let engineQueue = DispatchQueue(label: "com.flashmoe.engine", qos: .userInitiated)
@@ -74,8 +118,8 @@ final class FlashMoEEngine: @unchecked Sendable {
 
     /// Load a model from the given path. Runs on a background thread.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
-                   useTiered: Bool = false, cacheIOSplit: Int = 1,
-                   verbose: Bool = false) async throws {
+                   useTiered: Bool = false, use2bit: Bool = false,
+                   cacheIOSplit: Int = 1, verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
@@ -106,6 +150,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.max_context = Int32(maxContext)
                 config.think_budget = Int32(thinkBudget)
                 config.use_tiered = useTiered ? 1 : 0
+                config.use_2bit = use2bit ? 1 : 0
                 config.cache_io_split = Int32(cacheIOSplit)
                 config.verbose = verbose ? 1 : 0
 
@@ -128,13 +173,24 @@ final class FlashMoEEngine: @unchecked Sendable {
                 let info = ModelInfo(
                     name: modelName,
                     numLayers: Int(stats.num_layers),
+                    numLinearLayers: Int(stats.num_linear_layers),
+                    numFullAttnLayers: Int(stats.num_full_attn_layers),
                     numExperts: Int(stats.num_experts),
                     activeExpertsK: Int(stats.active_experts_k),
                     hiddenDim: Int(stats.hidden_dim),
                     vocabSize: Int(stats.vocab_size),
+                    numAttnHeads: Int(stats.num_attn_heads),
+                    numKVHeads: Int(stats.num_kv_heads),
+                    headDim: Int(stats.head_dim),
+                    moeIntermediate: Int(stats.moe_intermediate),
+                    expertQuantBits: Int(stats.expert_quant_bits),
+                    denseQuantBits: Int(stats.dense_quant_bits),
+                    denseAvgBits: stats.dense_avg_bits,
+                    isSmokeTest: stats.is_smoke_test != 0,
                     weightFileBytes: UInt64(stats.weight_file_bytes),
                     expertFileBytes: UInt64(stats.expert_file_bytes),
-                    metalBufferBytes: UInt64(stats.metal_buffer_bytes)
+                    metalBufferBytes: UInt64(stats.metal_buffer_bytes),
+                    expertSizeEach: UInt64(stats.expert_size_each)
                 )
 
                 DispatchQueue.main.async {

@@ -31,6 +31,7 @@ struct ModelListView: View {
     @State private var loadError: String?
     @State private var selectedModel: LocalModel?
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
+    @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
     private let downloadManager = DownloadManager.shared
 
     var body: some View {
@@ -96,6 +97,13 @@ struct ModelListView: View {
                 }
             }
 
+            Section("Chat Settings") {
+                Toggle("Chat Template", isOn: $chatTemplateEnabled)
+                Text("Wraps prompts in Qwen chat format (<|im_start|>). Disable for smoke test models or raw text mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let error = downloadManager.error,
                downloadManager.activeDownload == nil {
                 Section {
@@ -159,7 +167,9 @@ struct ModelListView: View {
             do {
                 try await engine.loadModel(
                     at: model.path,
+                    maxContext: 4096,
                     useTiered: model.hasTiered,
+                    use2bit: model.has2bit && !model.hasTiered && !model.has4bit,
                     cacheIOSplit: cacheIOSplit,
                     verbose: true
                 )
@@ -248,32 +258,49 @@ enum ModelScanner {
     private static func scanDirectory(_ path: String, into models: inout [LocalModel]) async {
         let fm = FileManager.default
 
-        guard let entries = try? fm.contentsOfDirectory(atPath: path) else { return }
+        print("[model-scan] Scanning: \(path)")
+        guard let entries = try? fm.contentsOfDirectory(atPath: path) else {
+            print("[model-scan] ERROR: cannot list \(path)")
+            return
+        }
+        print("[model-scan] Found \(entries.count) entries: \(entries.sorted().joined(separator: ", "))")
 
         for entry in entries {
             let fullPath = (path as NSString).appendingPathComponent(entry)
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: fullPath, isDirectory: &isDir), isDir.boolValue else { continue }
 
-            // Check if it's a valid model
-            if FlashMoEEngine.validateModel(at: fullPath) {
-                // Protect model files from iOS storage optimization / purging
-                excludeFromBackup(URL(fileURLWithPath: fullPath))
-                let size = directorySize(at: fullPath)
-                let hasTiered = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_tiered/layer_00.bin"))
-                let has4bit = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts/layer_00.bin"))
-                let has2bit = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_2bit/layer_00.bin"))
-
-                models.append(LocalModel(
-                    name: entry,
-                    path: fullPath,
-                    sizeBytes: size,
-                    hasTiered: hasTiered,
-                    has4bit: has4bit,
-                    has2bit: has2bit
-                ))
+            let valid = FlashMoEEngine.validateModel(at: fullPath)
+            if !valid {
+                // Debug: show why validation failed
+                let hasConfig = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("config.json"))
+                let hasWeights = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("model_weights.bin"))
+                let hasManifest = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("model_weights.json"))
+                let hasExperts4 = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts/layer_00.bin"))
+                let hasExpertsT = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_tiered/layer_00.bin"))
+                let hasExperts2 = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_2bit/layer_00.bin"))
+                print("[model-scan] SKIP '\(entry)': config=\(hasConfig) weights=\(hasWeights) manifest=\(hasManifest) experts(4bit=\(hasExperts4) tiered=\(hasExpertsT) 2bit=\(hasExperts2))")
+                continue
             }
+
+            // Protect model files from iOS storage optimization / purging
+            excludeFromBackup(URL(fileURLWithPath: fullPath))
+            let size = directorySize(at: fullPath)
+            let hasTiered = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_tiered/layer_00.bin"))
+            let has4bit = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts/layer_00.bin"))
+            let has2bit = fm.fileExists(atPath: (fullPath as NSString).appendingPathComponent("packed_experts_2bit/layer_00.bin"))
+
+            print("[model-scan] OK '\(entry)': size=\(size / (1024*1024))MB tiered=\(hasTiered) 4bit=\(has4bit) 2bit=\(has2bit)")
+            models.append(LocalModel(
+                name: entry,
+                path: fullPath,
+                sizeBytes: size,
+                hasTiered: hasTiered,
+                has4bit: has4bit,
+                has2bit: has2bit
+            ))
         }
+        print("[model-scan] Total valid models: \(models.count)")
     }
 
     private static func directorySize(at path: String) -> UInt64 {

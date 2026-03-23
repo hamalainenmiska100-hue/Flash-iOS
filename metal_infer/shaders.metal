@@ -27,6 +27,7 @@
 
 #include <metal_stdlib>
 using namespace metal;
+#include "gguf_iq_shared.h"
 
 // ============================================================================
 // BFloat16 helpers
@@ -38,6 +39,316 @@ inline float bf16_to_f32(uint16_t bf16) {
 
 inline uint16_t f32_to_bf16(float f) {
     return uint16_t(as_type<uint>(f) >> 16);
+}
+
+inline float f16_to_f32(ushort fp16_bits) {
+    return float(as_type<half>(fp16_bits));
+}
+
+#define GGUF_QK8_0 32
+#define GGUF_QK_K FLASH_MOE_GGUF_QK_K
+#define GGUF_Q8_MAX_IN_DIM 8192
+
+struct GGUFBlockQ8_0 {
+    ushort d;
+    char   qs[GGUF_QK8_0];
+};
+
+struct GGUFBlockQ6K {
+    uchar ql[GGUF_QK_K/2];
+    uchar qh[GGUF_QK_K/4];
+    char  scales[GGUF_QK_K/16];
+    ushort d;
+};
+
+static inline uchar2 flash_moe_get_scale_min_k4(uint j, device const uchar *q) {
+    return j < 4 ? uchar2{uchar(q[j] & 63), uchar(q[j + 4] & 63)}
+                 : uchar2{uchar((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)),
+                          uchar((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4))};
+}
+
+kernel void dequant_matvec_iq3_xxs(
+    device const GGUFBlockIQ3XXS* W [[buffer(0)]],
+    device const uint16_t*        unused_scales [[buffer(1)]],
+    device const uint16_t*        unused_biases [[buffer(2)]],
+    device const float*           x [[buffer(3)]],
+    device float*                 out [[buffer(4)]],
+    constant uint&                out_dim [[buffer(5)]],
+    constant uint&                in_dim [[buffer(6)]],
+    constant uint&                unused_group_size [[buffer(7)]],
+    threadgroup char*             shmem [[threadgroup(0)]],
+    uint                          tgid [[threadgroup_position_in_grid]],
+    ushort                        tiisg [[thread_index_in_simdgroup]],
+    ushort                        sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 4;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    const uint nb32_total = blocks_per_row * (GGUF_QK_K / 32);
+    device const GGUFBlockIQ3XXS* row_blocks = W + first_row * blocks_per_row;
+
+    threadgroup uint*  svalues = reinterpret_cast<threadgroup uint*>(shmem);
+    threadgroup uchar* ssigns  = reinterpret_cast<threadgroup uchar*>(svalues + 256);
+
+    const uint grid_pos = (32u * sgitg + tiisg) * 4u;
+    for (uint i = 0; i < 4; ++i) {
+        svalues[grid_pos + i] = flash_moe_iq3xxs_grid[grid_pos + i];
+    }
+    const uint sign_pos = (32u * sgitg + tiisg) * 2u;
+    for (uint i = 0; i < 2; ++i) {
+        ssigns[sign_pos + i] = flash_moe_ksigns_iq2xs[sign_pos + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float yl[32];
+    float sumf[NR0] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    device const float* x_block = x + 32 * tiisg;
+
+    for (uint ib32 = tiisg; ib32 < nb32_total; ib32 += 32) {
+        for (uint i = 0; i < 32; ++i) {
+            yl[i] = x_block[i];
+        }
+
+        const uint bi = ib32 / (GGUF_QK_K / 32);
+        const uint sub = ib32 % (GGUF_QK_K / 32);
+
+        device const GGUFBlockIQ3XXS* xr = row_blocks + bi;
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ3XXS& blk = xr[row * blocks_per_row];
+            device const uchar* q3 = blk.qs + 8 * sub;
+            device const ushort* gas = reinterpret_cast<device const ushort*>(blk.qs + GGUF_QK_K / 4) + 2 * sub;
+            const uint aux32 = uint(gas[0]) | (uint(gas[1]) << 16);
+            const float d = f16_to_f32(blk.d) * (0.5f + float(aux32 >> 28));
+
+            float2 sum = float2(0.0f);
+            for (uint l = 0; l < 4; ++l) {
+                const threadgroup uchar* grid1 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 0]);
+                const threadgroup uchar* grid2 = reinterpret_cast<threadgroup uchar*>(svalues + q3[2 * l + 1]);
+                const uchar signs = ssigns[(aux32 >> (7 * l)) & 127];
+
+                for (uint j = 0; j < 4; ++j) {
+                    sum[0] += yl[8 * l + j + 0] * float(grid1[j]) * ((signs & flash_moe_kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                    sum[1] += yl[8 * l + j + 4] * float(grid2[j]) * ((signs & flash_moe_kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+            }
+            sumf[row] += d * (sum[0] + sum[1]);
+        }
+
+        x_block += 32 * 32;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum * 0.5f;
+        }
+    }
+}
+
+kernel void dequant_matvec_iq4_xs(
+    device const GGUFBlockIQ4XS* W [[buffer(0)]],
+    device const uint16_t*       unused_scales [[buffer(1)]],
+    device const uint16_t*       unused_biases [[buffer(2)]],
+    device const float*          x [[buffer(3)]],
+    device float*                out [[buffer(4)]],
+    constant uint&               out_dim [[buffer(5)]],
+    constant uint&               in_dim [[buffer(6)]],
+    constant uint&               unused_group_size [[buffer(7)]],
+    threadgroup char*            shmem [[threadgroup(0)]],
+    uint                         tgid [[threadgroup_position_in_grid]],
+    ushort                       tiisg [[thread_index_in_simdgroup]],
+    ushort                       sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NR0 = 2;
+    constexpr ushort NSG = 2;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    threadgroup float * shmem_f32 = reinterpret_cast<threadgroup float *>(shmem);
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+
+    const ushort ix = tiisg / 16;  // 0 or 1
+    const ushort it = tiisg % 16;  // 0..15
+    const ushort ib = it / 2;
+    const ushort il = it % 2;
+
+    shmem_f32[tiisg] = flash_moe_kvalues_iq4nl_f[tiisg % 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 yl[4];
+    float sumf[NR0] = {0.0f, 0.0f};
+    device const float * yb = x + ix * GGUF_QK_K + ib * 32 + il * 8;
+
+    uint2 aux32;
+    thread const uchar * q8 = reinterpret_cast<thread const uchar *>(&aux32);
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 2) {
+        device const float4 * y4 = reinterpret_cast<device const float4 *>(yb);
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+            device const GGUFBlockIQ4XS & blk = W[(first_row + row) * blocks_per_row + bi];
+            device const uint * q4 = reinterpret_cast<device const uint *>(blk.qs + 16 * ib + 8 * il);
+
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+
+            aux32[0] = q4[0] & 0x0f0f0f0f;
+            aux32[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            float4 qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            float4 qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = q4[1] & 0x0f0f0f0f;
+            aux32[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            qf1 = float4(shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]);
+            qf2 = float4(shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]);
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+
+            const int ls = int((blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                           (int((blk.scales_h >> (2 * ib)) & 0x3) << 4);
+            sumf[row] += f16_to_f32(blk.d) * float(ls - 32) *
+                         (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+
+        yb += 2 * GGUF_QK_K;
+    }
+
+    for (ushort row = 0; row < NR0 && first_row + row < out_dim; ++row) {
+        const float sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = sum;
+        }
+    }
+}
+
+static inline uchar2 flash_moe_get_scale_min_k4_just2(uint j, device const uchar *q) {
+    if (j < 4) {
+        return uchar2{uchar(q[j + 0] & 63), uchar(q[j + 4] & 63)};
+    }
+    return uchar2{
+        uchar((q[j + 4] & 0xF) | ((q[j - 4] & 0xC0) >> 2)),
+        uchar((q[j + 4] >> 4) | ((q[j - 0] & 0xC0) >> 2))
+    };
+}
+
+kernel void dequant_matvec_q5_k(
+    device const GGUFBlockQ5K* W [[buffer(0)]],
+    device const uint16_t*     unused_scales [[buffer(1)]],
+    device const uint16_t*     unused_biases [[buffer(2)]],
+    device const float*        x [[buffer(3)]],
+    device float*              out [[buffer(4)]],
+    constant uint&             out_dim [[buffer(5)]],
+    constant uint&             in_dim [[buffer(6)]],
+    constant uint&             unused_group_size [[buffer(7)]],
+    uint                       tgid [[threadgroup_position_in_grid]],
+    ushort                     tiisg [[thread_index_in_simdgroup]],
+    ushort                     sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    (void)unused_scales;
+    (void)unused_biases;
+    (void)unused_group_size;
+
+    constexpr ushort NSG = 2;
+
+    const uint row = tgid * NSG + sgitg;
+    if (row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ5K * row_blocks = W + row * blocks_per_row;
+
+    const short tid = tiisg / 4;
+    const short ix  = tiisg % 4;
+    const short iq  = tid / 4;
+    const short ir  = tid % 4;
+    const short l0  = 8 * ir;
+    const short q_offset = 32 * iq + l0;
+    const short y_offset = 64 * iq + l0;
+
+    const uchar hm1 = uchar(1u << (2 * iq));
+    const uchar hm2 = uchar(hm1 << 1);
+    const uchar hm3 = uchar(hm1 << 4);
+    const uchar hm4 = uchar(hm2 << 4);
+
+    uint16_t sc16[4];
+    thread const uchar * sc8 = reinterpret_cast<thread const uchar *>(sc16);
+    float sumf = 0.0f;
+    device const float * y1 = x + ix * GGUF_QK_K + y_offset;
+
+    for (uint bi = ix; bi < blocks_per_row; bi += 4) {
+        device const GGUFBlockQ5K &blk = row_blocks[bi];
+        device const uchar * q1 = blk.qs + q_offset;
+        device const uchar * qh = blk.qh + l0;
+        device const ushort * a = reinterpret_cast<device const ushort *>(blk.scales) + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = float4(0.0f);
+        float yl[16];
+        float yh[16];
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];  sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];  sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        sc16[0] = a[0] & 0x3f3f;
+        sc16[1] = a[2] & 0x3f3f;
+        sc16[2] = ((a[4] >> 0) & 0x0f0f) | ((a[0] & 0xc0c0) >> 2);
+        sc16[3] = ((a[4] >> 4) & 0x0f0f) | ((a[2] & 0xc0c0) >> 2);
+
+        float4 acc1 = {0.0f};
+        float4 acc2 = {0.0f};
+        device const uchar * q2 = q1 + 64;
+        for (short l = 0; l < 8; ++l) {
+            const uchar h = qh[l];
+            acc1[0] += yl[l + 0] * float(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * float(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * float(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * float(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.0f;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.0f;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.0f;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.0f;
+        }
+
+        const float d = f16_to_f32(blk.d);
+        const float minv = f16_to_f32(blk.dmin);
+        sumf += d * (float(sc8[0]) * (acc1[0]         + 16.0f * acc2[0]) +
+                     float(sc8[1]) * (acc1[1] / 16.0f + 16.0f * acc2[1]) +
+                     float(sc8[4]) * (acc1[2]         + 16.0f * acc2[2]) +
+                     float(sc8[5]) * (acc1[3] / 16.0f + 16.0f * acc2[3])) -
+                minv * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                        sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+        y1 += 4 * GGUF_QK_K;
+    }
+
+    const float sum = simd_sum(sumf);
+    if (tiisg == 0) {
+        out[row] = sum;
+    }
 }
 
 
@@ -163,6 +474,104 @@ kernel void dequant_matvec_4bit_fast(
 }
 
 // ============================================================================
+// GGUF Q8_0 matvec for resident tensors
+// Reuses the same tiled shape as the 4-bit kernel: 8 rows per threadgroup.
+// ============================================================================
+
+kernel void dequant_matvec_q8_0(
+    device const GGUFBlockQ8_0* W      [[buffer(0)]],
+    device const float*         x      [[buffer(1)]],
+    device float*               out    [[buffer(2)]],
+    constant uint&              out_dim [[buffer(3)]],
+    constant uint&              in_dim  [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row = tgid * 8 + simd_group;
+    const uint blocks_per_row = in_dim / GGUF_QK8_0;
+
+    threadgroup float x_shared[GGUF_Q8_MAX_IN_DIM];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const GGUFBlockQ8_0* row_blocks = W + row * blocks_per_row;
+    float acc = 0.0f;
+
+    for (uint bi = simd_lane; bi < blocks_per_row; bi += 32) {
+        device const GGUFBlockQ8_0& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        const uint base = bi * GGUF_QK8_0;
+        for (uint i = 0; i < GGUF_QK8_0; i++) {
+            acc += d * float(blk.qs[i]) * x_shared[base + i];
+        }
+    }
+
+    const float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// GGUF Q6_K matvec for resident tensors
+// One SIMD group handles one output row exactly, preserving GGUF block layout.
+// ============================================================================
+
+kernel void dequant_matvec_q6_k(
+    device const GGUFBlockQ6K* W      [[buffer(0)]],
+    device const float*        x      [[buffer(1)]],
+    device float*              out    [[buffer(2)]],
+    constant uint&             out_dim [[buffer(3)]],
+    constant uint&             in_dim  [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint row = tgpig.x;
+    if (row >= out_dim) return;
+
+    const uint blocks_per_row = in_dim / GGUF_QK_K;
+    device const GGUFBlockQ6K* row_blocks = W + row * blocks_per_row;
+
+    float acc = 0.0f;
+
+    for (uint bi = 0; bi < blocks_per_row; ++bi) {
+        device const GGUFBlockQ6K& blk = row_blocks[bi];
+        const float d = f16_to_f32(blk.d);
+        device const float* x_block = x + bi * GGUF_QK_K;
+
+        for (uint part = 0; part < GGUF_QK_K; part += 128) {
+            device const uchar* ql = blk.ql + part / 2;
+            device const uchar* qh = blk.qh + part / 4;
+            device const char* sc = blk.scales + part / 16;
+
+            const uint is = lane / 16;
+            const uchar qh_lane = qh[lane];
+            const int q1 = int((ql[lane +  0] & 0xF) | (((qh_lane >> 0) & 0x3) << 4)) - 32;
+            const int q2 = int((ql[lane + 32] & 0xF) | (((qh_lane >> 2) & 0x3) << 4)) - 32;
+            const int q3 = int((ql[lane +  0] >> 4) | (((qh_lane >> 4) & 0x3) << 4)) - 32;
+            const int q4 = int((ql[lane + 32] >> 4) | (((qh_lane >> 6) & 0x3) << 4)) - 32;
+
+            const uint base = part + lane;
+            acc += d * float(sc[is + 0]) * float(q1) * x_block[base +  0];
+            acc += d * float(sc[is + 2]) * float(q2) * x_block[base + 32];
+            acc += d * float(sc[is + 4]) * float(q3) * x_block[base + 64];
+            acc += d * float(sc[is + 6]) * float(q4) * x_block[base + 96];
+        }
+    }
+
+    const float sum = simd_sum(acc);
+    if (lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
 // Fused gate+up+SwiGLU: reads x ONCE, computes silu(gate(x)) * up(x)
 // Saves one input read + one kernel dispatch per expert
 // ============================================================================
@@ -271,12 +680,14 @@ kernel void dequant_matvec_4bit_v3(
     // ---- Cache input vector in threadgroup shared memory ----
     // Max in_dim = 4096, so we need 4096 floats = 16KB shared memory
     // This is well within the 32KB threadgroup memory limit on M3
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
 
-    // Cooperative load: 256 threads load 4096 values (16 per thread)
-    // Store as half to halve shared memory (8KB vs 16KB) for better occupancy
+    // Cooperative load: 256 threads load 4096 floats (16 per thread)
+    // ALL threads must participate in this load + barrier, even if their
+    // row is out of bounds. Early return before the barrier causes only
+    // partial loading of x_shared, corrupting results for valid rows.
     for (uint i = lid; i < in_dim; i += 256) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -309,18 +720,14 @@ kernel void dequant_matvec_4bit_v3(
         // Rearranged: (nibble * scale + bias) * x = nibble * (scale*x) + bias*x
         // Pre-compute scale*x and bias*x, then use FMA for dequant+multiply in one op.
         // This reduces per-nibble from (convert + mul + add + mul + add) to (convert + FMA + add).
-        float x0 = float(x_shared[x_base + 0]), x1 = float(x_shared[x_base + 1]);
-        float x2 = float(x_shared[x_base + 2]), x3 = float(x_shared[x_base + 3]);
-        float x4 = float(x_shared[x_base + 4]), x5 = float(x_shared[x_base + 5]);
-        float x6 = float(x_shared[x_base + 6]), x7 = float(x_shared[x_base + 7]);
-        float sx0 = scale * x0;  float bx0 = bias * x0;
-        float sx1 = scale * x1;  float bx1 = bias * x1;
-        float sx2 = scale * x2;  float bx2 = bias * x2;
-        float sx3 = scale * x3;  float bx3 = bias * x3;
-        float sx4 = scale * x4;  float bx4 = bias * x4;
-        float sx5 = scale * x5;  float bx5 = bias * x5;
-        float sx6 = scale * x6;  float bx6 = bias * x6;
-        float sx7 = scale * x7;  float bx7 = bias * x7;
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
 
         acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
         acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
@@ -445,9 +852,9 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (row >= out_dim) return;
@@ -459,8 +866,8 @@ kernel void dequant_matvec_2bit(
     float acc = 0.0f;
 
     // Each lane processes strided columns (16 values per uint32)
-    // FMA optimization with half-precision x_shared
     for (uint col = simd_lane; col < packed_cols; col += 32) {
+        // group_size/16 packed words per group
         uint g = col / (group_size / 16);
         float scale = bf16_to_f32(s_row[g]);
         float bias  = bf16_to_f32(b_row[g]);
@@ -468,48 +875,23 @@ kernel void dequant_matvec_2bit(
         uint32_t packed = w_row[col];
         uint x_base = col * 16;
 
-        // Load x values from half shared mem and pre-compute scale*x, bias*x for FMA
-        float xv0  = float(x_shared[x_base +  0]), xv1  = float(x_shared[x_base +  1]);
-        float xv2  = float(x_shared[x_base +  2]), xv3  = float(x_shared[x_base +  3]);
-        float xv4  = float(x_shared[x_base +  4]), xv5  = float(x_shared[x_base +  5]);
-        float xv6  = float(x_shared[x_base +  6]), xv7  = float(x_shared[x_base +  7]);
-        float xv8  = float(x_shared[x_base +  8]), xv9  = float(x_shared[x_base +  9]);
-        float xv10 = float(x_shared[x_base + 10]), xv11 = float(x_shared[x_base + 11]);
-        float xv12 = float(x_shared[x_base + 12]), xv13 = float(x_shared[x_base + 13]);
-        float xv14 = float(x_shared[x_base + 14]), xv15 = float(x_shared[x_base + 15]);
-        float sx0  = scale * xv0;   float bx0  = bias * xv0;
-        float sx1  = scale * xv1;   float bx1  = bias * xv1;
-        float sx2  = scale * xv2;   float bx2  = bias * xv2;
-        float sx3  = scale * xv3;   float bx3  = bias * xv3;
-        float sx4  = scale * xv4;   float bx4  = bias * xv4;
-        float sx5  = scale * xv5;   float bx5  = bias * xv5;
-        float sx6  = scale * xv6;   float bx6  = bias * xv6;
-        float sx7  = scale * xv7;   float bx7  = bias * xv7;
-        float sx8  = scale * xv8;   float bx8  = bias * xv8;
-        float sx9  = scale * xv9;   float bx9  = bias * xv9;
-        float sx10 = scale * xv10;  float bx10 = bias * xv10;
-        float sx11 = scale * xv11;  float bx11 = bias * xv11;
-        float sx12 = scale * xv12;  float bx12 = bias * xv12;
-        float sx13 = scale * xv13;  float bx13 = bias * xv13;
-        float sx14 = scale * xv14;  float bx14 = bias * xv14;
-        float sx15 = scale * xv15;  float bx15 = bias * xv15;
-
-        acc += fma(float((packed >>  0) & 0x3), sx0,  bx0);
-        acc += fma(float((packed >>  2) & 0x3), sx1,  bx1);
-        acc += fma(float((packed >>  4) & 0x3), sx2,  bx2);
-        acc += fma(float((packed >>  6) & 0x3), sx3,  bx3);
-        acc += fma(float((packed >>  8) & 0x3), sx4,  bx4);
-        acc += fma(float((packed >> 10) & 0x3), sx5,  bx5);
-        acc += fma(float((packed >> 12) & 0x3), sx6,  bx6);
-        acc += fma(float((packed >> 14) & 0x3), sx7,  bx7);
-        acc += fma(float((packed >> 16) & 0x3), sx8,  bx8);
-        acc += fma(float((packed >> 18) & 0x3), sx9,  bx9);
-        acc += fma(float((packed >> 20) & 0x3), sx10, bx10);
-        acc += fma(float((packed >> 22) & 0x3), sx11, bx11);
-        acc += fma(float((packed >> 24) & 0x3), sx12, bx12);
-        acc += fma(float((packed >> 26) & 0x3), sx13, bx13);
-        acc += fma(float((packed >> 28) & 0x3), sx14, bx14);
-        acc += fma(float((packed >> 30) & 0x3), sx15, bx15);
+        // Unroll 16 x 2-bit extractions
+        acc += (float((packed >>  0) & 0x3) * scale + bias) * x_shared[x_base +  0];
+        acc += (float((packed >>  2) & 0x3) * scale + bias) * x_shared[x_base +  1];
+        acc += (float((packed >>  4) & 0x3) * scale + bias) * x_shared[x_base +  2];
+        acc += (float((packed >>  6) & 0x3) * scale + bias) * x_shared[x_base +  3];
+        acc += (float((packed >>  8) & 0x3) * scale + bias) * x_shared[x_base +  4];
+        acc += (float((packed >> 10) & 0x3) * scale + bias) * x_shared[x_base +  5];
+        acc += (float((packed >> 12) & 0x3) * scale + bias) * x_shared[x_base +  6];
+        acc += (float((packed >> 14) & 0x3) * scale + bias) * x_shared[x_base +  7];
+        acc += (float((packed >> 16) & 0x3) * scale + bias) * x_shared[x_base +  8];
+        acc += (float((packed >> 18) & 0x3) * scale + bias) * x_shared[x_base +  9];
+        acc += (float((packed >> 20) & 0x3) * scale + bias) * x_shared[x_base + 10];
+        acc += (float((packed >> 22) & 0x3) * scale + bias) * x_shared[x_base + 11];
+        acc += (float((packed >> 24) & 0x3) * scale + bias) * x_shared[x_base + 12];
+        acc += (float((packed >> 26) & 0x3) * scale + bias) * x_shared[x_base + 13];
+        acc += (float((packed >> 28) & 0x3) * scale + bias) * x_shared[x_base + 14];
+        acc += (float((packed >> 30) & 0x3) * scale + bias) * x_shared[x_base + 15];
     }
 
     float sum = simd_sum(acc);
@@ -1163,31 +1545,43 @@ kernel void rms_norm_qk(
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint base = head * key_dim;
-    uint simd_lane = tid % 32;
-    uint simd_group = tid / 32;
 
-    // RMS norm for q — SIMD-accelerated reduction
-    float qval = (tid < key_dim) ? q[base + tid] : 0;
-    float q_sq = qval * qval;
-    float q_simd = simd_sum(q_sq);
-    threadgroup float q_shared[4];  // 128 threads = 4 SIMD groups
-    if (simd_lane == 0) q_shared[simd_group] = q_simd;
+    // RMS norm for q
+    threadgroup float q_sum_sq;
+    if (tid == 0) q_sum_sq = 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_total = q_shared[0] + q_shared[1] + q_shared[2] + q_shared[3];
-    float q_inv_rms = rsqrt(q_total / float(key_dim) + 1e-6f);
+
+    float qval = (tid < key_dim) ? q[base + tid] : 0;
+    // Use threadgroup atomic add for sum of squares
+    float q_sq_local = qval * qval;
+    // Simple reduction: thread 0 accumulates (key_dim=128, fits in one pass)
+    threadgroup float q_partial[128];
+    q_partial[tid] = q_sq_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < key_dim; i++) s += q_partial[i];
+        q_sum_sq = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
-        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
+        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
     }
 
-    // RMS norm for k — SIMD-accelerated reduction
+    // RMS norm for k
+    threadgroup float k_sum_sq;
     float kval = (tid < key_dim) ? k[base + tid] : 0;
-    float k_sq = kval * kval;
-    float k_simd = simd_sum(k_sq);
-    threadgroup float k_shared[4];
-    if (simd_lane == 0) k_shared[simd_group] = k_simd;
+    threadgroup float k_partial[128];
+    k_partial[tid] = kval * kval;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float k_total = k_shared[0] + k_shared[1] + k_shared[2] + k_shared[3];
-    float k_inv_rms = rsqrt(k_total / float(key_dim) + 1e-6f);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < key_dim; i++) s += k_partial[i];
+        k_sum_sq = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
         k[base + tid] = kval * k_inv_rms * inv_scale;
     }
@@ -1238,17 +1632,18 @@ kernel void gated_rms_norm(
     uint base = head * value_dim;
 
     float val = (tid < value_dim) ? values[base + tid] : 0;
-    uint simd_lane = tid % 32;
-    uint simd_group = tid / 32;
 
-    // RMS norm reduction — SIMD-accelerated
-    float sq = val * val;
-    float simd_s = simd_sum(sq);
-    threadgroup float partial[4];  // 128 threads = 4 SIMD groups
-    if (simd_lane == 0) partial[simd_group] = simd_s;
+    // RMS norm reduction
+    threadgroup float partial[128];
+    partial[tid] = val * val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = partial[0] + partial[1] + partial[2] + partial[3];
-    float inv_rms = rsqrt(total / float(value_dim) + eps);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < value_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(partial[0] / float(value_dim) + eps);
 
     if (tid < value_dim) {
         float normed = val * inv_rms;

@@ -23,6 +23,7 @@
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
 		EE1111111111111111111111 /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2222222222222222222222 /* ProfilerView.swift */; };
 		F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = 50DF36AC37579556033D375F /* FlashMoEEngine.m */; };
+		FF3333333333333333333333 /* nax_gemm.metal in Resources */ = {isa = PBXBuildFile; fileRef = FF1111111111111111111111 /* nax_gemm.metal */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -47,6 +48,7 @@
 		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EE2222222222222222222222 /* ProfilerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilerView.swift; sourceTree = "<group>"; };
 		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
+		FF1111111111111111111111 /* nax_gemm.metal */ = {isa = PBXFileReference; lastKnownFileType = text; path = nax_gemm.metal; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -90,6 +92,7 @@
 		436D67F159A3C0FA4F05317F /* metal_infer */ = {
 			isa = PBXGroup;
 			children = (
+				FF1111111111111111111111 /* nax_gemm.metal */,
 				EEC822B6F9CE0BABA49E989B /* shaders.metal */,
 				575B85659731B0C7F170E59E /* tokenizer.h */,
 			);
@@ -235,6 +238,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */,
+				FF3333333333333333333333 /* nax_gemm.metal in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -395,8 +399,8 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
-				DEVELOPMENT_TEAM = YMCRS53QKE;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+				DEVELOPMENT_TEAM = ARRY5366Y3;
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -420,7 +424,7 @@
 					"-DACCELERATE_NEW_LAPACK",
 				);
 				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = flashmoe.anemll.com;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
@@ -439,8 +443,8 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
-				DEVELOPMENT_TEAM = YMCRS53QKE;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+				DEVELOPMENT_TEAM = ARRY5366Y3;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -467,7 +471,7 @@
 					"-DACCELERATE_NEW_LAPACK",
 				);
 				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = flashmoe.anemll.com;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";

@@ -14,8 +14,9 @@ import Darwin.Mach
 
 // MARK: - System Metrics Sampler
 
+@MainActor
 @Observable
-final class SystemMetrics: @unchecked Sendable {
+final class SystemMetrics {
     private(set) var residentMemoryMB: Double = 0
     private(set) var availableMemoryMB: Double = 0
     private(set) var cpuUsagePercent: Double = 0
@@ -260,11 +261,13 @@ struct ProfilerView: View {
     // MARK: - Sampling
 
     private func startSampling() {
-        metrics.sample() // initial
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+    metrics.sample() // initial
+    timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+        Task { @MainActor in
             metrics.sample()
         }
     }
+}
 
     private func stopSampling() {
         timer?.invalidate()
